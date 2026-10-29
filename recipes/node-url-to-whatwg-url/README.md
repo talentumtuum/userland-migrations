@@ -66,6 +66,18 @@ npx codemod @nodejs/node-url-to-whatwg-url
 
 ### Limitations
 
+`url.parse()` calls are migrated only when their argument is an unescaped string
+literal or a template literal without substitutions that is valid as an absolute
+WHATWG URL. Relative URLs (including paths, query strings, fragments and
+protocol-relative URLs), dynamic inputs and escaped literals are left unchanged,
+with a warning identifying the call for manual review. Their legacy property
+accesses and required imports are preserved. If the same result variable also
+receives a legacy URL, its other parse assignments are preserved as well.
+
+Adding an arbitrary base URL would change fields such as `href`, `hostname` and
+`protocol`. Review these cases using the
+[Node.js guidance for `url.parse()`](https://nodejs.org/api/url.html#urlparseurlstring-parsequerystring-slashesdenotehost).
+
 `url.format()` reconstruction from an object argument relies on static analysis of the object's properties. Complex cases — such as objects with many computed or dynamic properties — may not be fully transformed and could require manual review.
 
 <!-- sync_to_learn: false -->

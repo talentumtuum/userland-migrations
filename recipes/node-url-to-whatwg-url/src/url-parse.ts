@@ -1,12 +1,27 @@
 import { getNodeImportStatements } from '@nodejs/codemod-utils/ast-grep/import-statement';
 import { getNodeRequireCalls } from '@nodejs/codemod-utils/ast-grep/require-call';
 import { resolveBindingPath } from '@nodejs/codemod-utils/ast-grep/resolve-binding-path';
-import type { SgRoot, Edit } from '@codemod.com/jssg-types/main';
+import type { SgRoot, SgNode, Edit } from '@codemod.com/jssg-types/main';
 import type JS from '@codemod.com/jssg-types/langs/javascript';
 
 const VALID_VARIABLE_NAME_REGEX = /^[$A-Z_a-z][$\w]*$/;
 const DESTRUCTURING_ASSIGNMENT_REGEX = /^[^{]+{\s*[^}]+\s*}\s*=\s*/;
 const HOSTNAME_BRACKETS_REGEX = /^\[|\]$/;
+
+// Only migrate inputs whose value can be checked without executing user code.
+// A relative URL has no equivalent WHATWG URL without introducing a base URL.
+function isAbsoluteURLLiteral(arg: SgNode<JS> | null): boolean {
+	if (!arg || (arg.kind() !== 'string' && arg.kind() !== 'template_string')) {
+		return false;
+	}
+	if (arg.find({ rule: { kind: 'template_substitution' } })) return false;
+
+	const value = arg.text().slice(1, -1);
+	// Leave escaped literals for manual review instead of interpreting JS escapes.
+	if (value.includes('\\')) return false;
+
+	return URL.canParse(value);
+}
 
 const fieldsToReplace = [
 	{
@@ -81,6 +96,8 @@ export default function transform(root: SgRoot<JS>): string | null {
 	// 1.a) Identify variables assigned from parse(...) so we only rewrite legacy
 	// properties (auth, path, hostname) on those specific objects
 	const parseResultVars = new Set<string>();
+	const legacyResultVars = new Set<string>();
+	const assignments: Array<{ name: string; arg: SgNode<JS> }> = [];
 	for (const pattern of parseCallPatterns) {
 		const matches = rootNode.findAll({
 			rule: {
@@ -97,9 +114,28 @@ export default function transform(root: SgRoot<JS>): string | null {
 			const obj = m.getMatch('OBJ');
 			if (!obj) continue;
 			const name = obj.text();
-			if (VALID_VARIABLE_NAME_REGEX.test(name)) parseResultVars.add(name);
+			const arg = m.getMatch('ARG');
+			if (!arg || !VALID_VARIABLE_NAME_REGEX.test(name)) continue;
+			assignments.push({ name, arg });
+			if (isAbsoluteURLLiteral(arg)) {
+				parseResultVars.add(name);
+			} else {
+				legacyResultVars.add(name);
+			}
 		}
 	}
+
+	// If a variable also receives a legacy URL, keep all its parse assignments and
+	// property accesses unchanged rather than mixing the two object shapes.
+	const legacyArguments = new Set<number>();
+	for (const { name, arg } of assignments) {
+		if (legacyResultVars.has(name)) {
+			parseResultVars.delete(name);
+			legacyArguments.add(arg.range().start.index);
+		}
+	}
+	const canMigrate = (arg: SgNode<JS> | null): boolean =>
+		isAbsoluteURLLiteral(arg) && !legacyArguments.has(arg.range().start.index);
 
 	// 1.b) Replace parse calls with new URL()
 	//      Also, for declarations using `var`, upgrade to `let` while keeping `const` as-is.
@@ -109,6 +145,15 @@ export default function transform(root: SgRoot<JS>): string | null {
 		for (const call of calls) {
 			const arg = call.getMatch('ARG');
 			if (!arg) continue;
+			if (!canMigrate(arg)) {
+				const { start } = call.range();
+				console.warn(
+					`${root.filename()}:${start.line + 1}:${start.column + 1}: ` +
+						'Skipping url.parse(): the input or its result may require legacy URL semantics. ' +
+						'Review this call manually: https://nodejs.org/api/url.html#urlparseurlstring-parsequerystring-slashesdenotehost',
+				);
+				continue;
+			}
 
 			edits.push(call.replace(`new URL(${arg.text()})`));
 		}
@@ -168,6 +213,7 @@ export default function transform(root: SgRoot<JS>): string | null {
 				rule: { pattern: `${pattern}.${key}` },
 			});
 			for (const node of directAccesses) {
+				if (!canMigrate(node.getMatch('ARG'))) continue;
 				// Reconstruct base as the matched expression before .key
 				const baseExpr = node.text().replace(new RegExp(`\\.${key}$`), '');
 				let replacement = '';
@@ -195,6 +241,7 @@ export default function transform(root: SgRoot<JS>): string | null {
 			});
 
 			for (const node of directDestructures) {
+				if (!canMigrate(node.getMatch('ARG'))) continue;
 				const text = node.text();
 				const hadSemi = /;\s*$/.test(text);
 				const rhsText = text.replace(DESTRUCTURING_ASSIGNMENT_REGEX, '');
